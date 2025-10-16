@@ -1,0 +1,26 @@
+each batch 
+[ Someone is walking over there. ]
+-> byte
+[ 0,1,2,3,3,1,4,5,6,1,32,15,180 ]
+-> patch
+[ [0,1],[2,3,3,1,4],[5,6,1,32,15,180] ]
+[ p1,    p2,         p3]
+
+Local Encoder:
+
+cross-attention first or last?? (first in Perceiver paper)
+ 
+cross-att(byte, patch)  - only byte from the same patch can attend to each other.
+self-att(patch)         - allow patch to attend to each other (causal or no mask??)
+
+#Patch embedding initiated randomly or pooled from byte embedding???
+All attention modules in the Perceiver are non-causal: we use no masks. (from Perceiver paper they have no mask? Be careful not to leak future token)
+
++What is the inference flow? 
+patch input -> encoder -> global -> decoder -> new byte -> concat  (recalculate entropies and patch again for each new token)
+                                                             |  
+    |---------------------------------------------------------
+
++Can this architecture be cached with KV cache? The patch can change with each new byte generated (maybe this is not how blt generate new bytes)
+
++Maybe should implement this in my own way but need to inspect their code thoroughly

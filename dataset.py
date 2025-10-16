@@ -4,7 +4,7 @@ from datasets import load_dataset
 
 
 class CustomDataset(Dataset):
-    def __init__(self, tokenizer, max_length=512, split="train"):
+    def __init__(self, tokenizer, dataset:str, max_length=512, split="train"):
         """
         Dataset for next-token prediction.
 
@@ -13,7 +13,7 @@ class CustomDataset(Dataset):
             tokenizer (BltTokenizer): Your tokenizer object.
             max_length (int): Max sequence length (including BOS and EOS if added).
         """
-        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1")
+        ds = load_dataset()
         texts = ds[split]['text']
         self.tokenizer = tokenizer
         self.max_length = max_length

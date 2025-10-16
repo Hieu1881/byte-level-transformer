@@ -2,10 +2,11 @@ from models.entropy_model import EntropyModel, EntropyModelArgs
 import torch
 import torch.nn as nn
 from dataset import CustomDataset
-from torch.utils.data import DataLoader
-from torch.nn.utils.rnn import pad_sequence
+
+from dataloader import CustomDataloader
+
 from models.tokenizer import Tokenizer
-from models.constant import SpecialTokens
+
 from tqdm import tqdm
 import os
 import time
@@ -14,15 +15,8 @@ epochs = 10
 batch_size = 128
 vocab_size = 260
 early_stopping = 10
+dataset = ""
 
-def collate_fn(batch):
-    input_ids = [item["input_ids"] for item in batch]
-    labels = [item["labels"] for item in batch]
-
-    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=SpecialTokens.PAD_ID)
-    labels = pad_sequence(labels, batch_first=True, padding_value=SpecialTokens.PAD_ID)
-
-    return {"input_ids": input_ids, "labels": labels}
 
 def train():
     args = EntropyModelArgs()
@@ -31,11 +25,9 @@ def train():
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
     tokenizer = Tokenizer()
-    train_dataset = CustomDataset(tokenizer, max_length=args.max_seqlen, split="train")
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    train_dataloader = CustomDataloader(tokenizer=tokenizer, dataset=dataset, batch_size=batch_size, shuffle=True, split='train')
 
-    val_dataset = CustomDataset(tokenizer, max_length=args.max_seqlen, split="validation")
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    val_dataloader = CustomDataloader(tokenizer=tokenizer, dataset=dataset, batch_size=batch_size, shuffle=False, split='validation')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     model_params = sum(p.numel() for p in model.parameters())
