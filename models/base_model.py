@@ -44,170 +44,69 @@ class BaseTransformerArgs(BaseModel):
     bos_id: int | None = SpecialTokens.BOS_ID
 
 
-def precompute_freqs_cis(dim:int, end:int, theta:float = 10000.0, rope_use_fp32_in_outer_product:bool = False):
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+def apply_rotary_emb(x,cos,sin):
+    assert x.ndim == 4, "shape must be 4 (bs,nheads,seq_len,dim)"
+    d = x.shape[-1] // 2
+    x1, x2 = x[:,:,:,:d], x[:,:,:,d:] #[bs,nheads,deq_len,d]
+    y1 = x1 * cos + x2 * sin 
+    y2 = x1 * (-sin) + x2 * cos
+    out = torch.cat([y1,y2],dim=-1)
+    out = out.to(x.dtype)
+    return out
 
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
+def repeat_kv(x, n_rep):
+    """torch.repeat_interleave(x, dim=1, repeats=n_rep)"""
+    if n_rep == 1:
+        return x
+    bs, n_kv_heads, slen, head_dim = x.shape
+    return (
+        x[:, :, None, :, :]
+        .expand(bs, n_kv_heads, n_rep, slen, head_dim)
+        .reshape(bs, n_kv_heads * n_rep, slen, head_dim)
+    )
 
-    Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
-
-    Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-    """
-
-    freqs = 1.0 / (theta**(torch.arange(0,dim,2)[:(dim // 2 )].float() / dim)) #head_dim/2
-    t = torch.arange(end,device=freqs.device)                                  #max_seqlen
-    if rope_use_fp32_in_outer_product:
-        t = t.to(torch.float32)
-    freqs = torch.outer(t, freqs).float()
-
-    cos, sin = freqs.cos(), freqs.sin()
-    return torch.stack((cos,-sin,sin,cos),dim=-1).view(*freqs.size(),2,2) #head/2, max_seqlen,2,2
-
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self,theta:float,head_dim:int,max_seqlen:int=1024,rope_use_fp32_in_outer_product: bool = False):
-        super().__init__()
-        self.theta = theta
-        self.head_dim = head_dim
-        self.max_seqlen = max_seqlen
-        self.rope_use_fp32_in_outer_product = rope_use_fp32_in_outer_product
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(
-                dim=head_dim,
-                end=max_seqlen,
-                theta=theta,
-                rope_use_fp32_in_outer_product=rope_use_fp32_in_outer_product
-            ),
-            persistent=False
-        )
-    
-    def reset_parameters(self):
-        self.freqs_cis[...] = precompute_freqs_cis(
-            dim=self.head_dim,
-            end=self.max_seqlen,
-            theta=self.theta,
-            rope_use_fp32_in_outer_product=self.rope_use_fp32_in_outer_product,
-        )
-
-    def forward(self, seqlen: Optional[int] = None, tok_idx: Optional[torch.Tensor] = None ):
-        """
-        Return freqs_cis corresponding to consecutive seqlen positions or the corresponding tok_idx positions
-        Args:
-            seqlen (int): Contiguous sequence length
-            tok_idx (torch.Tensor[int]): Position indices of each token this overrides seqlen
-
-        Returns:
-            Tuple(torch.Tensor, torch.Tensor): Embedded input tensor and freqs_cis
-        """
-        test = (seqlen is not None) or (tok_idx is not None)
-        assert test, "Should provide atleast seqlen or tok_idx"
-        if tok_idx is not None:
-            return self.freqs_cis[tok_idx]
-        elif seqlen is not None:
-            return self.freqs_cis[0:seqlen]
-        
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor, seq_dim: int):
-    """
-    Reshape frequency tensor for broadcasting it with another tensor.
-
-    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
-    for the purpose of broadcasting the frequency tensor during element-wise operations.
-
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
-        seq_dim (int): Sequence dimension index.
-
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
-    """
-    ndim = x.ndim
-    assert 0 <= seq_dim < ndim
-    assert freqs_cis.shape == (
-        x.shape[seq_dim],
-        x.shape[-3],
-        2,
-        2,
-    ), f"freqs_cis vs x: {(freqs_cis.shape, x.shape)}"
-    shape = [
-        d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-2])
-    ] + [2, 2]
-    return freqs_cis.view(*shape)
-
-
-def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, seq_dim: int, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor,torch.Tensor]:
-    xq_ = xq.reshape(*xq.shape[:-1],-1,1,2) #bs,seq_len,nheads,dim//2,1,2   -> convert to complex form
-    xk_ = xk.reshape(*xk.shape[:-1],-1,1,2)
-    freqs_cis = reshape_for_broadcast(freqs_cis,xq_,seq_dim).float()
-    # print(freqs_cis.shape)
-    # print('seq_dim:', seq_dim)
-    
-    xq_out = (xq_ * freqs_cis).sum(5).flatten(3)
-    xk_out = (xk_ * freqs_cis).sum(5).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
+def norm(x):
+    return F.rms_norm(x,(x.size(-1),)) #This doesnt have learnable params??
 
 
 class Attention(nn.Module):
-    def __init__(self,dim:int, n_heads:int ):
+    def __init__(self, dim, n_head,n_kv_head):
         super().__init__()
         self.dim = dim
-        self.n_heads = n_heads
-        assert self.dim % self.n_heads == 0
-        self.head_dim = self.dim // self.n_heads
+        self.n_head = n_head
+        self.n_kv_head = n_kv_head
+        # self.layer_idx = layer_idx     #No kv cache implemented yet
+        assert self.dim // n_head == 0
+        self.head_dim = dim // n_head
 
-        self.wq = nn.Linear(self.dim,self.dim,bias=False)
-        self.wk = nn.Linear(self.dim,self.dim,bias=False)
-        self.wv = nn.Linear(self.dim,self.dim,bias=False)
-        self.wo = nn.Linear(self.dim,self.dim,bias=False)
-        
-    def forward(self,x: torch.Tensor, mask: Union[torch.Tensor,bool], freqs_cis: torch.Tensor):
-        xq = self.wq(x)
-        xk = self.wk(x)
-        xv = self.wv(x)
+        self.c_q = nn.Linear(self.dim,self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.dim,self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.dim,self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.dim, self.dim, bias= False)
 
-        bs, seq_len, _ = x.shape
-        output_shape = xq.shape
+    def forward(self,x,cos_sin,mask=None, kv_cache=None):
+        bs, slen, dim = x.shape
 
-        xq = xq.view(bs, seq_len, self.n_heads, self.head_dim)
-        xk = xk.view(bs, seq_len, self.n_heads, self.head_dim)
-        xv = xv.view(bs, seq_len, self.n_heads, self.head_dim)
+        q = self.c_q(x).view(bs,slen,self.n_head,self.head_dim)
+        k = self.c_k(x).view(bs,slen,self.n_kv_head,self.head_dim)
+        v = self.c_v(x).view(bs,slen,self.n_kv_head,self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq,xk,1,freqs_cis[0:seq_len])
-        xq, xk, xv = map(lambda e: e.transpose(1,2), (xq, xk, xv))
-        out = F.scaled_dot_product_attention(xq,xk,xv,is_causal=mask)
+        cos, sin = cos_sin
+        q = apply_rotary_emb(q,cos,sin)
+        k = apply_rotary_emb(k,cos,sin)
+        q, k = norm(q), norm(k)
+        transpose = lambda x: x.transpose(1,2)
+        q, k, v = map(transpose,(q,k,v))
 
-        out = out.transpose(1,2).contiguous() #bs,seq_len,heads,h_dim
-        out = out.reshape(*output_shape)
-        return self.wo(out)
-    
-    def reset_parameters(self, init_std=None, factor=1.0):
-        init_std = init_std or (self.dim ** (-0.5)) / factor
+        q_slen = q.size(2)
+        kv_slen = k.size(2)
 
-        for w in [self.wq, self.wk, self.wv]:
-            nn.init.trunc_normal_(
-                w.weight,
-                mean=0.0,
-                std=init_std,
-                a=-3 * init_std,
-                b=3 * init_std,
-            )
+        nrep = self.n_head // self.n_kv_head
+        k,v = repeat_kv(k,nrep), repeat_kv(v,nrep)
+        att = F.scaled_dot_product_attention(q,k,v,is_causal=True)
 
-        nn.init.trunc_normal_(
-            self.wo.weight,
-            mean=0.0,
-            std=init_std,
-            a=-3 * init_std,
-            b=3 * init_std,
-        )
+        out = self.c_proj(att).transpose(1,2).contiguous().view(bs,slen,-1)
+        return out
 
 
 class FeedForward(nn.Module):
@@ -265,7 +164,8 @@ class Block(nn.Module):
 
         self.attention = Attention(
             dim=args.dim,
-            n_heads=args.n_heads
+            n_head=args.n_heads,
+            n_kv_head=args.n_heads,           
         )
 
         self.ffwd = FeedForward(
@@ -274,18 +174,16 @@ class Block(nn.Module):
             multiple_of= args.multiple_of          
         )
 
-        self.attention_norm = RMSNorm(args.dim, eps = args.norm_eps)
-        self.ffwd_norm = RMSNorm(args.dim, eps = args.norm_eps)
 
-    def forward(self,x: torch.Tensor, freqs_cis: torch.Tensor, mask: Union[torch.Tensor,bool]) -> torch.Tensor:
+    def forward(self,x: torch.Tensor, cos_sin: torch.Tensor, mask: Union[torch.Tensor,bool]) -> torch.Tensor:
         attn_output = self.attention(
-            x=self.attention_norm(x),
-            freqs_cis=freqs_cis,
+            x=self.norm(x),
+            cos_sin=cos_sin,
             mask=mask
         )
 
         h = x + attn_output
-        h_norm = self.ffwd_norm(h)
+        h_norm = norm(h)
         return h + self.ffwd(h_norm)
 
     def init_weights(self, init_std=None, factor=1.0):
@@ -299,17 +197,13 @@ class BaseTransformer(nn.Module):
     def __init__(self,args:BaseTransformerArgs):
         super().__init__()
         self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
         self.init_base_std = args.init_base_std
-        self.attn_impl = args.attn_impl
-        self.attn_bias_type = args.attn_bias_type
         self.init_std_factor = InitStdFactor(args.init_std_factor)
         self.max_seqlen = args.max_seqlen
-        self.rope_embeddings = RotaryEmbedding(
-            theta=args.rope_theta,
-            head_dim=args.head_dim or args.dim // args.n_heads,
-            max_seqlen=args.max_seqlen,
-            rope_use_fp32_in_outer_product=args.rope_use_fp32_in_outer_product,
-        )
+        self.rotary_seq_len = 10* args.max_seqlen
+
+        
         self.eos_id = args.eos_id
 
         self.layers = nn.ModuleList()
@@ -317,9 +211,9 @@ class BaseTransformer(nn.Module):
             self.layers.append(Block(args))
     
     def forward(self,h, mask:Union[torch.Tensor,bool]):
-        freqs_cis = self.rope_embeddings(seqlen=self.max_seqlen)
+        cos_sin = self._precompute_rotary_embeddings(seqlen=self.max_seqlen,head_dim=self.head_dim)
         for i,layer in enumerate(self.layers):
-            h = layer(h,freqs_cis=freqs_cis,mask=mask)
+            h = layer(h,cos_sin=cos_sin,mask=mask)
         return h
     
     def init_weights(self):
@@ -333,6 +227,19 @@ class BaseTransformer(nn.Module):
             }[self.init_std_factor]
 
             layer.init_weights(self.init_base_std, factor)
+
+    def _precompute_rotary_embeddings(self,seq_len,head_dim,base=100000, device='cuda'):
+        #stride the channel
+        channel_range = torch.arange(0,head_dim,2,dtype=torch.float32,device=device)
+        inv_freqs = 1.0 / (base ** (channel_range / head_dim))
+        #stride the time step
+        t = torch.arange(seq_len,dtype=torch.float32,device=device)
+        freqs = torch.outer(t,inv_freqs)
+        cos, sin = freqs.cos(), freqs.sin()
+        cos, sin = cos.bfloat16(), sin.bfloat16()   #Maybe this needs to be checked for gpu maynot support this
+        cos, sin = cos[None,:, None, :], sin[None,:, None,:]
+        return cos,sin
+    
 
 
 

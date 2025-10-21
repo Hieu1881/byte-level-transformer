@@ -24,3 +24,4 @@ patch input -> encoder -> global -> decoder -> new byte -> concat  (recalculate 
 +Can this architecture be cached with KV cache? The patch can change with each new byte generated (maybe this is not how blt generate new bytes)
 
 +Maybe should implement this in my own way but need to inspect their code thoroughly
++Do i need to use the hash n-gram embedding, can we use something else?
