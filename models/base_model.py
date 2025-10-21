@@ -68,9 +68,10 @@ def repeat_kv(x, n_rep):
 def norm(x):
     return F.rms_norm(x,(x.size(-1),)) #This doesnt have learnable params??
 
-
+# Need to implement this with custom mask so that it can be generalized to cross attention, block causal attention, v.v
+# Should use flex attention to perform dynamic patch mask
 class Attention(nn.Module):
-    def __init__(self, dim, n_head,n_kv_head):
+    def __init__(self, dim, n_head,n_kv_head, is_cross_attention: torch.bool):
         super().__init__()
         self.dim = dim
         self.n_head = n_head
@@ -78,6 +79,7 @@ class Attention(nn.Module):
         # self.layer_idx = layer_idx     #No kv cache implemented yet
         assert self.dim // n_head == 0
         self.head_dim = dim // n_head
+        self.is_causal_attention = not is_cross_attention
 
         self.c_q = nn.Linear(self.dim,self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.dim,self.n_kv_head * self.head_dim, bias=False)
@@ -95,15 +97,14 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q,cos,sin)
         k = apply_rotary_emb(k,cos,sin)
         q, k = norm(q), norm(k)
-        transpose = lambda x: x.transpose(1,2)
-        q, k, v = map(transpose,(q,k,v))
+        q, k, v = map(lambda e: e.transpose(1,2),(q,k,v))
 
         q_slen = q.size(2)
         kv_slen = k.size(2)
 
         nrep = self.n_head // self.n_kv_head
         k,v = repeat_kv(k,nrep), repeat_kv(v,nrep)
-        att = F.scaled_dot_product_attention(q,k,v,is_causal=True)
+        att = F.scaled_dot_product_attention(q,k,v,is_causal=self.is_causal_attention,attn_mask=mask)
 
         out = self.c_proj(att).transpose(1,2).contiguous().view(bs,slen,-1)
         return out
@@ -216,17 +217,6 @@ class BaseTransformer(nn.Module):
             h = layer(h,cos_sin=cos_sin,mask=mask)
         return h
     
-    def init_weights(self):
-        self.rope_embeddings.reset_parameters()
-        for depth, layer in enumerate(self.layers):
-            factor = {
-                InitStdFactor.CURRENT_DEPTH: (2 * (depth + 1)) ** 0.5,
-                InitStdFactor.GLOBAL_DEPTH: (2 * (len(self.layers) + 1)) ** 0.5,
-                InitStdFactor.DIM_RATIO: self.dim / 4096,
-                InitStdFactor.DISABLED: 1.0,
-            }[self.init_std_factor]
-
-            layer.init_weights(self.init_base_std, factor)
 
     def _precompute_rotary_embeddings(self,seq_len,head_dim,base=100000, device='cuda'):
         #stride the channel

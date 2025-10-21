@@ -7,7 +7,7 @@ class EntropyModelArgs(BaseTransformerArgs):
     vocab_size: int = 260
     n_layers: int = 3
     n_heads: int = 8
-    max_seqlen: int = 256
+    max_seqlen: int = 256  #maybe longer seq_len?
 
 
 class EntropyModel(BaseTransformer):
@@ -21,6 +21,4 @@ class EntropyModel(BaseTransformer):
         out = super().forward(tok_emb,mask=True)
         return self.language_head(out) #bs,seq_len,vocab_size
     
-    def calculate_entropy(self, logits: torch.Tensor):
-        entropy = torch.sum(torch.log(logits)*logits, dim=-1) #bs,seq_len
-        return entropy
+
